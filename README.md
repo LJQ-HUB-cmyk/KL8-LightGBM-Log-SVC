@@ -50,7 +50,7 @@ git add .
 
 #### 6. 提交本地更改
 ```bash
-git commit -m "Initial commit: 快乐8智能分析系统完整版本"
+git commit -m "Initial commit: 修改NameError: name 'use_dynamic_adjustment' is not defined问题"
 ```
 
 #### 7. 将分支重命名为main（如果当前是master分支）

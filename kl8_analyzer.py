@@ -132,16 +132,16 @@ DEFAULT_WEIGHTS = {
     'TOP_N_FOR_CANDIDATE': 50,
 
     # --- 号码评分权重 ---
-    # 号码历史总频率得分的权重
-    'FREQ_SCORE_WEIGHT': 28.19,
-    # 号码当前遗漏值（与平均遗漏的偏差）得分的权重
-    'OMISSION_SCORE_WEIGHT': 19.92,
+    # 号码历史总频率得分的权重 (降低默认值，避免过度依赖)
+    'FREQ_SCORE_WEIGHT': 15.0,
+    # 号码当前遗漏值（与平均遗漏的偏差）得分的权重 (提高权重)
+    'OMISSION_SCORE_WEIGHT': 25.0,
     # 号码当前遗漏与其历史最大遗漏比率的得分权重
     'MAX_OMISSION_RATIO_SCORE_WEIGHT': 16.12,
-    # 号码近期出现频率的得分权重
-    'RECENT_FREQ_SCORE_WEIGHT': 15.71,
-    # 号码的机器学习模型预测出现概率的得分权重
-    'ML_PROB_SCORE_WEIGHT': 22.43,
+    # 号码近期出现频率的得分权重 (提高权重)
+    'RECENT_FREQ_SCORE_WEIGHT': 20.0,
+    # 号码的机器学习模型预测出现概率的得分权重 (提高权重)
+    'ML_PROB_SCORE_WEIGHT': 30.0,
 
     # --- 组合属性匹配奖励 ---
     # 推荐组合的奇数个数若与历史最常见模式匹配，获得的奖励分值
@@ -895,7 +895,7 @@ def objective(trial: optuna.trial.Trial, df_for_opt: pd.DataFrame, ml_lags: List
     """Optuna 的目标函数，用于评估一组给定的权重参数的好坏。"""
     trial_weights = {}
     
-    # 动态地从DEFAULT_WEIGHTS构建搜索空间
+    # 动态地从DEFAULT_WEIGHTS构建搜索空间，但限制某些参数的范围
     for key, value in DEFAULT_WEIGHTS.items():
         if isinstance(value, int):
             if 'NUM_COMBINATIONS' in key: trial_weights[key] = trial.suggest_int(key, 5, 15)
@@ -908,7 +908,13 @@ def objective(trial: optuna.trial.Trial, df_for_opt: pd.DataFrame, ml_lags: List
             elif 'SUPPORT' in key:
                 # ARM支持度特殊处理：避免优化出无法使用的极小值
                 trial_weights[key] = trial.suggest_float(key, max(0.01, value * 0.5), min(0.1, value * 2.0))
-            else: # 对权重参数使用更宽的搜索范围
+            elif key == 'FREQ_SCORE_WEIGHT':
+                # 严格限制历史频率权重的上限，防止过度依赖
+                trial_weights[key] = trial.suggest_float(key, 5.0, 25.0)  # 限制在5-25之间
+            elif key in ['OMISSION_SCORE_WEIGHT', 'ML_PROB_SCORE_WEIGHT']:
+                # 对遗漏和ML权重给予更大的搜索空间
+                trial_weights[key] = trial.suggest_float(key, value * 0.8, value * 3.0)
+            else: # 对其他权重参数使用较宽的搜索范围
                 trial_weights[key] = trial.suggest_float(key, value * 0.5, value * 2.0)
 
     full_trial_weights = DEFAULT_WEIGHTS.copy()
@@ -920,7 +926,12 @@ def objective(trial: optuna.trial.Trial, df_for_opt: pd.DataFrame, ml_lags: List
     
     # 在快速回测中评估这组权重
     with SuppressOutput():
-        _, backtest_stats = run_backtest(df_for_opt, ml_lags, full_trial_weights, trial_arm_rules, OPTIMIZATION_BACKTEST_PERIODS)
+        backtest_results_df, backtest_stats = run_backtest(df_for_opt, ml_lags, full_trial_weights, trial_arm_rules, OPTIMIZATION_BACKTEST_PERIODS)
+        
+        # 同时生成一个推荐样本来评估多样性
+        sample_recs, _, _, _, sample_scores = run_analysis_and_recommendation(
+            df_for_opt.iloc[:-5], ml_lags, full_trial_weights, trial_arm_rules
+        )
         
     # 定义一个分数来衡量表现，根据快乐8真实奖金价值设定权重
     # 权重设计思路：按奖金价值的对数分布设定，避免高额奖项过度影响优化方向
@@ -934,14 +945,67 @@ def objective(trial: optuna.trial.Trial, df_for_opt: pd.DataFrame, ml_lags: List
         '七等奖': 2       # 选九全不中的权重
     }
     
-    # 适配新的多玩法数据结构
-    score = 0
+    # 计算基础得分（回测表现）
+    base_score = 0
     prize_counts_by_play = backtest_stats.get('prize_counts_by_play', {})
     for play_type, prize_counts in prize_counts_by_play.items():
         for prize_level, count in prize_counts.items():
-            score += prize_weights.get(prize_level, 0) * count
+            base_score += prize_weights.get(prize_level, 0) * count
     
-    return score
+    # 计算多样性惩罚分数
+    diversity_penalty = 0
+    if sample_scores and sample_scores.get('number_scores'):
+        # 加载历史频率数据
+        freq_data = analyze_frequency_omission(df_for_opt)
+        historical_freq = freq_data.get('freq', {})
+        
+        if historical_freq:
+            # 获取历史频率TOP 20号码
+            top_freq_numbers = set([n for n, _ in sorted(historical_freq.items(), key=lambda x: x[1], reverse=True)[:20]])
+            
+            # 检查推荐的选十号码
+            if 10 in sample_recs:
+                recommended_numbers = set(sample_recs[10]['numbers'])
+                overlap = len(recommended_numbers & top_freq_numbers)
+                overlap_ratio = overlap / len(recommended_numbers)
+                
+                # 如果与历史频率TOP20的重合度超过70%，给予惩罚
+                if overlap_ratio > 0.7:
+                    diversity_penalty = (overlap_ratio - 0.7) * 500  # 最大惩罚150分
+            
+            # 检查复式推荐的前10个号码
+            if 'complex' in sample_recs:
+                complex_top10 = set(sample_recs['complex']['numbers'][:10])
+                complex_overlap = len(complex_top10 & top_freq_numbers)
+                complex_overlap_ratio = complex_overlap / 10
+                
+                # 如果复式推荐前10与历史频率TOP20重合度超过80%，给予额外惩罚  
+                if complex_overlap_ratio > 0.8:
+                    diversity_penalty += (complex_overlap_ratio - 0.8) * 300  # 最大惩罚60分
+    
+    # 权重平衡奖励：鼓励更平衡的权重分配
+    balance_bonus = 0
+    freq_weight = full_trial_weights.get('FREQ_SCORE_WEIGHT', 0)
+    omission_weight = full_trial_weights.get('OMISSION_SCORE_WEIGHT', 0)
+    ml_weight = full_trial_weights.get('ML_PROB_SCORE_WEIGHT', 0)
+    
+    # 如果遗漏权重或ML权重超过频率权重，给予奖励
+    if omission_weight > freq_weight:
+        balance_bonus += 50
+    if ml_weight > freq_weight:
+        balance_bonus += 50
+    
+    # 如果频率权重过高（超过总权重的40%），给予惩罚
+    total_main_weights = freq_weight + omission_weight + ml_weight + full_trial_weights.get('RECENT_FREQ_SCORE_WEIGHT', 0)
+    if total_main_weights > 0:
+        freq_ratio = freq_weight / total_main_weights
+        if freq_ratio > 0.4:
+            balance_bonus -= (freq_ratio - 0.4) * 200  # 频率权重占比惩罚
+    
+    # 最终得分 = 基础得分 - 多样性惩罚 + 平衡奖励
+    final_score = base_score - diversity_penalty + balance_bonus
+    
+    return final_score
 
 def optuna_progress_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial, total_trials: int):
     """Optuna 的回调函数，用于在控制台报告优化进度。"""
