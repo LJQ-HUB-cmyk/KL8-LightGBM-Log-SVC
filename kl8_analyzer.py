@@ -910,10 +910,10 @@ def objective(trial: optuna.trial.Trial, df_for_opt: pd.DataFrame, ml_lags: List
                 trial_weights[key] = trial.suggest_float(key, max(0.01, value * 0.5), min(0.1, value * 2.0))
             elif key == 'FREQ_SCORE_WEIGHT':
                 # 严格限制历史频率权重的上限，防止过度依赖
-                trial_weights[key] = trial.suggest_float(key, 5.0, 25.0)  # 限制在5-25之间
+                trial_weights[key] = trial.suggest_float(key, 5.0, 18.0)  # 进一步限制上限到18
             elif key in ['OMISSION_SCORE_WEIGHT', 'ML_PROB_SCORE_WEIGHT']:
                 # 对遗漏和ML权重给予更大的搜索空间
-                trial_weights[key] = trial.suggest_float(key, value * 0.8, value * 3.0)
+                trial_weights[key] = trial.suggest_float(key, value * 1.0, value * 4.0)  # 扩大搜索范围
             else: # 对其他权重参数使用较宽的搜索范围
                 trial_weights[key] = trial.suggest_float(key, value * 0.5, value * 2.0)
 
@@ -952,7 +952,7 @@ def objective(trial: optuna.trial.Trial, df_for_opt: pd.DataFrame, ml_lags: List
         for prize_level, count in prize_counts.items():
             base_score += prize_weights.get(prize_level, 0) * count
     
-    # 计算多样性惩罚分数
+    # 计算多样性惩罚分数 - 强化版本
     diversity_penalty = 0
     if sample_scores and sample_scores.get('number_scores'):
         # 加载历史频率数据
@@ -960,8 +960,8 @@ def objective(trial: optuna.trial.Trial, df_for_opt: pd.DataFrame, ml_lags: List
         historical_freq = freq_data.get('freq', {})
         
         if historical_freq:
-            # 获取历史频率TOP 20号码
-            top_freq_numbers = set([n for n, _ in sorted(historical_freq.items(), key=lambda x: x[1], reverse=True)[:20]])
+            # 获取历史频率TOP 15号码（缩小范围）
+            top_freq_numbers = set([n for n, _ in sorted(historical_freq.items(), key=lambda x: x[1], reverse=True)[:15]])
             
             # 检查推荐的选十号码
             if 10 in sample_recs:
@@ -969,19 +969,25 @@ def objective(trial: optuna.trial.Trial, df_for_opt: pd.DataFrame, ml_lags: List
                 overlap = len(recommended_numbers & top_freq_numbers)
                 overlap_ratio = overlap / len(recommended_numbers)
                 
-                # 如果与历史频率TOP20的重合度超过70%，给予惩罚
-                if overlap_ratio > 0.7:
-                    diversity_penalty = (overlap_ratio - 0.7) * 500  # 最大惩罚150分
+                # 如果与历史频率TOP15的重合度超过50%，给予重惩罚
+                if overlap_ratio > 0.5:
+                    diversity_penalty = (overlap_ratio - 0.5) * 1000  # 最大惩罚500分
+                # 即使只有40%重合度也要轻微惩罚
+                elif overlap_ratio > 0.4:
+                    diversity_penalty = (overlap_ratio - 0.4) * 500  # 最大惩罚50分
             
-            # 检查复式推荐的前10个号码
+            # 检查复式推荐的前10个号码 - 这是关键！
             if 'complex' in sample_recs:
                 complex_top10 = set(sample_recs['complex']['numbers'][:10])
                 complex_overlap = len(complex_top10 & top_freq_numbers)
                 complex_overlap_ratio = complex_overlap / 10
                 
-                # 如果复式推荐前10与历史频率TOP20重合度超过80%，给予额外惩罚  
-                if complex_overlap_ratio > 0.8:
-                    diversity_penalty += (complex_overlap_ratio - 0.8) * 300  # 最大惩罚60分
+                # 如果复式推荐前10与历史频率TOP15重合度超过60%，给予重惩罚  
+                if complex_overlap_ratio > 0.6:
+                    diversity_penalty += (complex_overlap_ratio - 0.6) * 1500  # 最大惩罚600分
+                # 即使只有50%重合度也要轻微惩罚
+                elif complex_overlap_ratio > 0.5:
+                    diversity_penalty += (complex_overlap_ratio - 0.5) * 800  # 最大惩罚80分
     
     # 权重平衡奖励：鼓励更平衡的权重分配
     balance_bonus = 0
