@@ -89,7 +89,7 @@ git log --oneline -5
 #### 推送本地更改到远程
 ```bash
 git add .
-git commit -m "修改奖金规则"
+git commit -m "优化频率算法"
 git push origin main
 ```
 

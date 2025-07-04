@@ -216,6 +216,39 @@ def parse_recommendations_from_report(content: str) -> Tuple[Dict, List]:
     log_message(f"从报告中解析出 {len(play_recommendations)} 种玩法推荐，{len(complex_numbers)} 个复式号码。", "INFO")
     return play_recommendations, complex_numbers
 
+def calculate_complex_pool_stats(complex_numbers: List, prize_numbers: List) -> Dict:
+    """
+    计算复式推荐号码池的命中统计。
+
+    Args:
+        complex_numbers (List): 复式推荐号码池。
+        prize_numbers (List): 开奖号码列表。
+
+    Returns:
+        Dict: 复式号码池统计信息
+    """
+    if not complex_numbers or not prize_numbers:
+        return {}
+    
+    prize_set = set(prize_numbers)
+    complex_set = set(complex_numbers)
+    
+    # 计算命中情况
+    hit_numbers = complex_set & prize_set
+    hit_count = len(hit_numbers)
+    total_pool_size = len(complex_numbers)
+    hit_rate = (hit_count / 20) * 100 if hit_count > 0 else 0  # 开奖号码总共20个
+    coverage_rate = (hit_count / total_pool_size) * 100 if total_pool_size > 0 else 0
+    
+    return {
+        'pool_size': total_pool_size,
+        'hit_count': hit_count,
+        'hit_numbers': sorted(list(hit_numbers)),
+        'hit_rate': hit_rate,  # 命中率：命中号码数/开奖号码总数
+        'coverage_rate': coverage_rate,  # 覆盖率：命中号码数/号码池大小
+        'pool_numbers': complex_numbers
+    }
+
 def calculate_multi_play_prize(play_recommendations: Dict, prize_numbers: List) -> Tuple[int, Dict, List]:
     """
     计算多种玩法的投注奖金和中奖情况。
@@ -316,6 +349,29 @@ def calculate_prize(tickets: List, prize_numbers: List) -> Tuple[int, Dict, List
     
     return calculate_multi_play_prize(play_recommendations, prize_numbers)
 
+def format_complex_pool_stats_for_report(complex_stats: Dict) -> List[str]:
+    """格式化复式推荐号码池统计信息为报告字符串。"""
+    if not complex_stats:
+        return ["  复式推荐号码池: 无数据"]
+    
+    result = []
+    result.append(f"  复式推荐号码池统计:")
+    result.append(f"    号码池大小: {complex_stats['pool_size']} 个")
+    result.append(f"    命中号码数: {complex_stats['hit_count']} 个")
+    result.append(f"    命中率: {complex_stats['hit_rate']:.1f}% (命中数/开奖总数20)")
+    result.append(f"    覆盖率: {complex_stats['coverage_rate']:.1f}% (命中数/号码池大小)")
+    
+    if complex_stats['hit_numbers']:
+        hit_str = ' '.join(f'{n:02d}' for n in complex_stats['hit_numbers'])
+        result.append(f"    命中号码: [{hit_str}]")
+    else:
+        result.append(f"    命中号码: 无")
+    
+    pool_str = ' '.join(f'{n:02d}' for n in complex_stats['pool_numbers'])
+    result.append(f"    号码池: [{pool_str}]")
+    
+    return result
+
 def format_multi_play_results_for_report(winning_list: List[Dict], prize_numbers: List) -> List[str]:
     """格式化多种玩法中奖信息为报告字符串。"""
     if not winning_list: 
@@ -393,15 +449,31 @@ def manage_report(new_entry: Optional[Dict] = None, new_error: Optional[str] = N
         # 计算各玩法的中奖情况
         play_details = new_entry.get('details', [])
         play_stats = []
+        complex_stats_lines = []
         total_bets = 10  # 10种玩法各投注1注
         total_wins = 0
         
-        # 从详情中提取各玩法验证结果
+        # 从详情中提取各玩法验证结果和复式统计
+        in_complex_section = False
         for detail in play_details:
-            if '选' in detail and ':' in detail:
-                if '未中奖' not in detail and '命中 0 个' not in detail:
+            detail_stripped = detail.strip()
+            if '复式推荐号码池统计' in detail_stripped:
+                in_complex_section = True
+                complex_stats_lines.append(detail_stripped)
+            elif in_complex_section:
+                complex_stats_lines.append(detail_stripped)
+            elif '选' in detail_stripped and ':' in detail_stripped:
+                if '未中奖' not in detail_stripped and '命中 0 个' not in detail_stripped:
                     total_wins += 1
-                play_stats.append(detail.strip())
+                play_stats.append(detail_stripped)
+            elif detail_stripped and not in_complex_section:
+                play_stats.append(detail_stripped)
+        
+        # 获取复式推荐统计信息
+        complex_stats = new_entry.get('complex_stats', {})
+        complex_summary = ""
+        if complex_stats:
+            complex_summary = f"\n\n复式推荐号码池表现:\n命中 {complex_stats.get('hit_count', 0)} 个号码，命中率 {complex_stats.get('hit_rate', 0):.1f}%，覆盖率 {complex_stats.get('coverage_rate', 0):.1f}%"
         
         # 生成格式化的验证报告
         new_report = f"""### 验证报告 #{report_counter} (期号: {new_entry['period']})
@@ -410,10 +482,12 @@ def manage_report(new_entry: Optional[Dict] = None, new_error: Optional[str] = N
 总投注注数: {total_bets}
 总中奖注数: {total_wins}
 总奖金: {new_entry['total_amount']} 元
-中奖率: {(total_wins/total_bets*100):.1f}%
+中奖率: {(total_wins/total_bets*100):.1f}%{complex_summary}
 
 各玩法验证结果:
 {chr(10).join(play_stats) if play_stats else '  暂无数据'}
+
+{chr(10).join(complex_stats_lines) if complex_stats_lines else ''}
 """
         normal_records.append(new_report)
     
@@ -482,9 +556,13 @@ def main_process():
         # 6. 计算各玩法中奖情况
         total_amount, prize_counts, winning_details = calculate_multi_play_prize(play_recommendations, prize_numbers)
         
+        # 6.1 计算复式推荐号码池统计
+        complex_stats = calculate_complex_pool_stats(complex_numbers, prize_numbers)
+        
         # 7. 格式化结果
         summary = ', '.join([f"{level}: {count}次" for level, count in prize_counts.items()]) if prize_counts else "未中奖"
         detail_lines = format_winning_tickets_for_report(winning_details, prize_numbers)
+        complex_lines = format_complex_pool_stats_for_report(complex_stats)
         
         # 8. 输出结果
         log_message(f"=== 期号 {eval_period} 验证结果 ===", "INFO")
@@ -495,13 +573,23 @@ def main_process():
             for line in detail_lines:
                 log_message(line, "INFO")
         
+        # 输出复式推荐号码池统计
+        if complex_stats:
+            log_message("复式推荐号码池统计:", "INFO")
+            for line in complex_lines:
+                log_message(line, "INFO")
+        
         # 9. 更新报告文件
+        # 合并详细信息和复式统计
+        all_details = detail_lines + ["\n"] + complex_lines if complex_stats else detail_lines
+        
         report_entry = {
             'period': eval_period,
             'total_amount': total_amount,
             'summary': summary,
-            'details': detail_lines,
-            'winning_numbers': ' '.join(f'{n:02d}' for n in sorted(prize_numbers))
+            'details': all_details,
+            'winning_numbers': ' '.join(f'{n:02d}' for n in sorted(prize_numbers)),
+            'complex_stats': complex_stats
         }
         manage_report(new_entry=report_entry)
         
@@ -516,4 +604,4 @@ def main_process():
         manage_report(new_error=error_msg)
 
 if __name__ == "__main__":
-    main_process() 
+    main_process()
